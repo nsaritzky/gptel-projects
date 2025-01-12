@@ -134,29 +134,38 @@ as arguments."
         (list gptel-projects-default-chat-name))))
 
 ;;;###autoload
-(defun gptel-projects-new (chat-name)
+(defun gptel-projects-open (chat-name)
   "Create a new chat buffer for the current project.
 CHAT-NAME is the name for this chat buffer. If called
 interactively, prompt for the name."
   (interactive
    (list
     (let* ((root (projectile-project-root))
-           (chats (gptel-projects--list-project-chats root))
+           (existing-chats (gptel-projects--list-project-chats root))
+           (choices (mapcar (lambda (f)
+                              (cons (file-name-sans-extension f) f))
+                            existing-chats))
            (default-name
             (let ((base gptel-projects-default-chat-name)
                   (n 0))
               (while (member
                       (if (= n 0) base
-                        (format "%s<%d>"
+                        (format "%s<%d>.gptel"
                                 (file-name-sans-extension base) n))
-                      chats)
+                      existing-chats)
                 (cl-incf n))
               (if (= n 0) base
-                (format "%s<%d>"
+                (format "%s<%d>.gptel"
                         (file-name-sans-extension base) n)))))
-      (read-string
-       (format "Chat name (default '%s'): " default-name)
-       nil 'gptel-projects--chat-history default-name))))
+      (let ((name (completing-read
+                   (format "Chat name (default '%s'): " default-name)
+                   existing-chats
+                   nil nil nil
+                   'gptel-projects--chat-history
+                   default-name)))
+        (if (string-suffix-p ".gptel" name)
+            name
+          (concat (file-name-sans-extension name) ".gptel"))))))
   (unless (projectile-project-root)
     (user-error "Not in a project"))
 
@@ -222,7 +231,7 @@ interactively, prompt for the name."
                      (expand-file-name file chat-dir)))
              (directory-files chat-dir nil "\\.gptel$"))))))
     (if (null choices)
-        (gptel-projects-new gptel-projects-default-chat-name)
+        (gptel-projects-open gptel-projects-default-chat-name)
       (let* ((choice
               (completing-read
                "Select chat: "
@@ -248,7 +257,7 @@ interactively, prompt for the name."
                            (file-name-nondirectory target))))
             (if-let ((buf (get-buffer buf-name)))
                 (pop-to-buffer buf)
-              (gptel-projects-new (file-name-nondirectory target))))))))))
+              (gptel-projects-open (file-name-nondirectory target))))))))))
 
 (defun gptel-projects--save-chats (&optional root)
   "Save all chat buffers for project ROOT.
