@@ -22,7 +22,7 @@
 (require 'gptel)
 (require 'gptel-context)
 (require 'gptel-anthropic)
-(require 'gptel-cache)
+(require 'gptel-projects-workspace)
 (require 'projectile)
 (require 'request)
 (require 'json)
@@ -110,6 +110,9 @@ as arguments."
 
 (defvar-local gptel-projects--root nil
   "Project root directory for this chat buffer.")
+
+(defvar gptel-projects--applying-context nil
+  "Internal flag to prevent recursive context application.")
 
 (defun gptel-projects--get-chat-dir (root)
   "Get the chat directory for project at ROOT."
@@ -336,9 +339,8 @@ positisions BEG and END."
       (insert-file-contents context-file)
       (goto-char (point-min))
       (gptel-projects--set-list (read (current-buffer)))
-      (message "Loaded context list: %S" (gptel-projects--get-list)) ; Debug logging
-      ;; Apply the loaded context
-      (gptel-projects-apply))))
+      (message "Loaded context list: %S" (gptel-projects--get-list))
+      )))
 
 (defun gptel-projects--add-and-save (rel-file abs-file)
   "Add REL-FILE to context list and save after token check passes.
@@ -433,11 +435,16 @@ ABS-FILE is the absolute path to the file."
 (defun gptel-projects-apply ()
   "Apply all files from the project's context list to the current gptel context."
   (interactive)
-  (when-let ((project-list (gptel-projects--get-list)))
-    (dolist (file project-list)
-      (let ((abs-file (gptel-projects--absolute-from-root file)))
-        (when (file-exists-p abs-file)
-          (gptel-context-add-file abs-file))))))
+  (unless gptel-projects--applying-context
+    (let ((gptel-projects--applying-context t))
+      (message "gptel-projects-apply called")
+      (gptel-context-remove-all)
+      (when-let ((project-list (gptel-projects--get-list)))
+        (dolist (file project-list)
+          (let ((abs-file (gptel-projects--absolute-from-root file)))
+            (when (file-exists-p abs-file)
+              (gptel-context-add-file abs-file))))
+        (gptel-projects-workspace--add-code-info-to-context)))))
 
 (defun gptel-projects-clear ()
   "Clear all context for the current project."
@@ -454,10 +461,7 @@ ABS-FILE is the absolute path to the file."
 This should be called when switching projects or initializing a project."
   (gptel-context-remove-all)
   (gptel-projects--set-list nil)
-  (gptel-projects-load)
-  (when-let ((list-buf (get-buffer "*GPTel Project Context*")))
-    (with-current-buffer list-buf
-      (gptel-projects--refresh-list-buffer))))
+  (gptel-projects-apply))
 
 ;;;###autoload
 (define-minor-mode gptel-projects-mode
@@ -467,7 +471,7 @@ This should be called when switching projects or initializing a project."
   (if gptel-projects-mode
       (progn
         (when (projectile-project-root)
-          (gptel-projects--switch-project))
+          (gptel-projects-load))
         (add-hook 'projectile-after-switch-project-hook
                   #'gptel-projects-load)
         (add-hook 'projectile-before-switch-project-hook

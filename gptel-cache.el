@@ -71,6 +71,8 @@ array for more effective caching."
              :stream ,(or (and gptel-stream gptel-use-curl
                                (gptel-backend-stream backend))
                           :json-false)
+             :max_tokens ,(or gptel-max-tokens
+                              1024)
              :messages ,(vconcat (nreverse cached-messages)
                                  (nreverse regular-messages)))))
       ;; Add standard request parameters

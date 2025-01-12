@@ -19,587 +19,323 @@
 ;;
 ;;; Code:
 
-(require 'gptel)
-(require 'gptel-context)
-(require 'gptel-anthropic)
-(require 'gptel-cache)
+(require 'treesit)
 (require 'projectile)
-(require 'request)
-(require 'json)
 
-(defgroup gptel-projects nil
-  "Project-specific context management for gptel."
-  :group 'gptel)
-
-(defcustom gptel-projects-filename ".gptel-context"
-  "Name of the file storing project-specific context lists.
-This file will be stored in the project root directory."
-  :type 'string
-  :group 'gptel-projects)
-
-(defcustom gptel-projects-relative-paths t
-  "Whether to store file paths relative to project root."
+(defcustom gptel-projects-workspace-collect-symbols t
+  "Wheter to collect symbols from project files using tree-sitter.
+When non-nil add names of functions, classes, and other symbols
+to the context when analyzing project files."
   :type 'boolean
   :group 'gptel-projects)
 
-(defcustom gptel-projects-token-limits
-  '((gpt-3.5-turbo . 16000)
-    (gpt-4 . 8000)
-    (gpt-4-32k . 32000)
-    (gpt-4-turbo . 128000)
-    (claude-3-5-sonnet-20241022 . 200000)
-    (claude-3-5-haiku-20241022 . 200000)
-    (claude-3-opus-20240229 . 200000))
-  "Alist mapping models to their maximum token limits.
-When non-nil, warn if context exceeds this limit.
-Each entry should be (model-name . limit).
-Set specific model limits to nil to disable checking."
-  :type '(alist :key-type symbol
-          :value-type (choice (integer :tag "Token limit")
-                              (const :tag "No limit" nil)))
+(defcustom gptel-projects-workspace-code-file-extensions
+  '(".el" ".py" ".js" ".jsx" ".ts" ".tsx" ".java" ".c" ".cpp" ".h" ".hpp" ".rs" ".go")
+  "List of file extensions to consider as code files for symbol extraction."
+  :type '(repeat string)
   :group 'gptel-projects)
 
-(defcustom gptel-projects-token-limit-action 'warn
-  "Action to take when context exceeds token limit.
-- warn: Display a warning message
-- ask: Ask user whether to continue
-- block: Don't add files that would exceed the limit"
-  :type '(choice (const :tag "Warn only" warn)
-          (const :tag "Ask to continue" ask)
-          (const :tag "Block addition" block))
-  :group 'gptel-projects)
+(defun gptel-projects-workspace--get-treesit-language (filename)
+  "Determine the tree-sitter language for FILENAME based on extension."
+  (when-let* ((ext (file-name-extension filename))
+              (lang-name
+               (cond
+                ((member (concat "." ext) '(".c" ".h")) "c")
+                ((member (concat "." ext) '(".cpp" ".hpp")) "cpp")
+                ((equal ext "py") "python")
+                ((equal ext "js") "javascript")
+                ((equal ext "jsx") "jsx")
+                ((equal ext "ts") "typescript")
+                ((equal ext "tsx") "tsx")
+                ((equal ext "java") "java")
+                ((equal ext "go") "go")
+                ((equal ext "rs") "rust")
+                ((equal ext "el") "elisp"))))
+    (intern lang-name)))
 
-(defcustom gptel-projects-chat-dir ".gptel"
-  "Directory name for storing project-specific chat files.
-This directory is created in the project root."
-  :type 'string
-  :group 'gptel-projects)
+(defun gptel-projects-workspace--get-parameters (node lang)
+  "Extract parameter list from NODE based on LANG."
+  (pcase lang
+    ('python
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (mapcar #'treeset-node-text
+               (treesit-filter-child
+                params (lambda (n) (equal (treesit-node-type n) "identifier"))))))
+    ((or 'javascript 'typescript 'tsx 'jsx)
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (let (param-names)
+         (treesit-search-subtree
+          params (lambda (n)
+                   (when (member (treesit-node-type n)
+                                 '("identifier" "pattern_identifier"))
+                     (push (treesit-node-text n) param-names))))
+         (nreverse param-names))))
+    ('java
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (let (param-names)
+         (treesit-search-subtree
+          params (lambda (n)
+                   (when-let ((id-node
+                               (treesit-node-child-by-field-name n "name")))
+                     (push (treesit-node-text id-node) param-names))))
+         (nreverse param-names))))
+    ('go
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (let (param-names)
+         (treesit-search-subtree
+          params (lambda (n)
+                   (when (equal (treesit-node-type n) "parameter-declaration")
+                     (push (treesit-node-text
+                            (treesit-node-child-by-field-name n "name"))
+                           param-names))))
+         (nreverse param-names))))
+    ('rust
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (let ((param-names nil))
+         (treesit-search-subtree
+          params (lambda (n)
+                   (when (equal (treesit-node-type n) "identifier")
+                     (progn (push (treesit-node-text n) param-names)
+                            nil))
+                   nil))
+         (nreverse param-names))))
+    ('elisp
+     (when-let ((params (treesit-node-child-by-field-name node "parameters")))
+       (mapcar #'treesit-node-text
+               (treesit-filter-child
+                params (lambda (n) (equal (treesit-node-type n) "symbol"))))))))
 
-(defcustom gptel-projects-default-chat-name "chat.gptel"
-  "Default name for new chat files."
-  :type 'string
-  :group 'gptel-projects)
+(defun gptel-projects-workspace--format-symbol (node-text params)
+  "Format NODE-TEXT with PARAMS as a symbol definition."
+  (if params
+      (format "%s(%s)" node-text (string-join params ", "))
+    (format "%s()" node-text)))
 
-(defcustom gptel-projects-save-chats t
-  "Whether to save project chat buffers automatically.
-When non-nil, chat buffers are saved when Emacs is closed or when
-the project is switched."
-  :type 'boolean
-  :group 'gptel-projects)
-
-(defcustom gptel-projects-after-response-functions nil
-  "Hooks run after each LLM response in a project chat buffer.
-Each function is called with the response start and end positions
-as arguments."
-  :type 'hook
-  :group 'gptel-projects)
-
-(defface gptel-projects-header-face
-  '((((class color) (min-colors 88) (background light))
-     :foreground "RoyalBlue4" :extend t)
-    (((class color) (min-colors 88) (background dark))
-     :foreground "LightSkyBlue" :extend t))
-  "Face for project chat buffer headers."
-  :group 'gptel-projects)
-
-(defvar gptel-projects--chat-buffers (make-hash-table :test 'equal)
-  "Hash table mapping project roots to their chat buffers.")
-
-(defvar gptel-projects--chat-history nil
-  "History of chat names for the current project.")
-
-(defvar-local gptel-projects--root nil
-  "Project root directory for this chat buffer.")
-
-(defun gptel-projects--get-chat-dir (root)
-  "Get the chat directory for project at ROOT."
-  (let ((dir (expand-file-name gptel-projects-chat-dir root)))
-    (unless (file-exists-p dir)
-      (make-directory dir t))
-    dir))
-
-(defun gptel-projects--buffer-name (project-name- chat-name)
-  "Generate a buffer name for PROJECT-NAME- and CHAT-NAME."
-  (format "*gptel: %s/%s*" project-name- chat-name))
-
-(defun gptel-projects--list-project-chats (root)
-  "List all chat files in project ROOT."
-  (let* ((chat-dir (gptel-projects--get-chat-dir root))
-         (files (and (file-exists-p chat-dir)
-                     (directory-files chat-dir nil "\\.gptel$"))))
-    (or files
-        (list gptel-projects-default-chat-name))))
-
-;;;###autoload
-(defun gptel-projects-new (chat-name)
-  "Create a new chat buffer for the current project.
-CHAT-NAME is the name for this chat buffer. If called
-interactively, prompt for the name."
-  (interactive
-   (list
-    (let* ((root (projectile-project-root))
-           (chats (gptel-projects--list-project-chats root))
-           (default-name
-            (let ((base gptel-projects-default-chat-name)
-                  (n 0))
-              (while (member
-                      (if (= n 0) base
-                        (format "%s<%d>"
-                                (file-name-sans-extension base) n))
-                      chats)
-                (cl-incf n))
-              (if (= n 0) base
-                (format "%s<%d>"
-                        (file-name-sans-extension base) n)))))
-      (read-string
-       (format "Chat name (default '%s'): " default-name)
-       nil 'gptel-projects--chat-history default-name))))
-  (unless (projectile-project-root)
-    (user-error "Not in a project"))
-
-  (let* ((root (projectile-project-root))
-         (existing-bufs (gethash root gptel-projects--chat-buffers))
-         (chat-file
-          (expand-file-name chat-name (gptel-projects--get-chat-dir root)))
-         (buf-name (gptel-projects--buffer-name
-                    (projectile-project-name) chat-name))
-         (buf (get-buffer-create buf-name)))
-    (with-current-buffer buf
-      (funcall gptel-default-mode)
-      (gptel-mode)
-      (setq-local gptel-projects--root root)
-      (puthash root
-               (cons buf (remq buf existing-bufs))
-               gptel-projects--chat-buffers)
-      (add-hook 'gptel-post-response-functions
-                #'gptel-projects--after-response nil t)
-      (add-hook 'kill-buffer-hook
-                #'gptel-projects--on-kill-buffer nil t)
-      (unless (file-exists-p chat-file)
-        (goto-char (point-min))
-        (insert
-         (propertize
-          (format "Chat: %s\nProject: %s\nCreated: %s\n\n"
-                  chat-name (projectile-project-name)
-                  (format-time-string "%Y-%m-%d %T"))
-          'face 'gptel-projects-header-face)))
-      (setq buffer-file-name chat-file)
-      (when (file-exists-p chat-file)
-        (insert-file-contents chat-file))
-      (goto-char (point-max))
-      (hack-local-variables))
-    (pop-to-buffer buf)
-    buf))
-
-;;;###autoload
-(defun gptel-projects-list ()
-  "List and switch to a project chat buffer."
-  (interactive)
-  (unless (projectile-project-root)
-    (user-error "Not in a project"))
-
-  (let* ((root (projectile-project-root))
-         (chat-dir (gptel-projects--get-chat-dir root))
-         (project-name- (projectile-project-name))
-         (existing-bufs (gethash root gptel-projects--chat-buffers))
-         (choices
-          (delete-dups
-           (append
-            (mapcar
-             (lambda (buf)
-               (cons (string-remove-prefix
-                      "*gptel: " (string-remove-suffix "*"
-                                                       (buffer-name buf)))
-                     buf))
-             existing-bufs)
-            (mapcar
-             (lambda (file)
-               (cons (format "%s/%s"
-                             project-name- file)
-                     (expand-file-name file chat-dir)))
-             (directory-files chat-dir nil "\\.gptel$"))))))
-    (if (null choices)
-        (gptel-projects-new gptel-projects-default-chat-name)
-      (let* ((choice
-              (completing-read
-               "Select chat: "
-               (lambda (str pred action)
-                 (if (eq action 'metadata)
-                     `(metadata
-                       (annotation-function
-                        . ,(lambda (key)
-                             (if-let ((buf (cdr (assoc key choices))))
-                                 (if (buffer-live-p buf)
-                                     "  [Open]"
-                                   "")
-                               ""))))
-                   (complete-with-action
-                    action choices str pred)))))
-             (target (cdr (assoc choice choices))))
-        (cond
-         ((and (bufferp target) (buffer-live-p target))
-          (pop-to-buffer target))
-         ((stringp target)
-          (let ((buf-name (gptel-projects--buffer-name
-                           project-name-
-                           (file-name-nondirectory target))))
-            (if-let ((buf (get-buffer buf-name)))
-                (pop-to-buffer buf)
-              (gptel-projects-new (file-name-nondirectory target))))))))))
-
-(defun gptel-projects--save-chats (&optional root)
-  "Save all chat buffers for project ROOT.
-If ROOT is nil, save chats for the current project."
-  (let ((roots (if root (list root)
-                 (hash-table-keys gptel-projects--chat-buffers))))
-    (dolist (project-root roots)
-      (dolist (buf (gethash project-root gptel-projects--chat-buffers))
-        (when (and (buffer-live-p buf)
-                   (buffer-modified-p buf))
-          (with-current-buffer buf
-            (save-buffer)))))))
-
-(defun gptel-projects--after-response (beg end)
-  "Function called after gptel response in project chat buffers.
-Runs `gptel-projects-after-response-functions' with the response
-positisions BEG and END."
-  (run-hook-with-args 'gptel-projects-after-response-functions beg end))
-
-(defun gptel-projects--on-kill-buffer ()
-  "Clean up when a project chat buffer is killed."
-  (when (and gptel-projects-save-chats
-             (buffer-modified-p))
-    (save-buffer))
-  (when gptel-projects--root
-    (let ((bufs (gethash gptel-projects--root
-                         gptel-projects--chat-buffers)))
-      (puthash gptel-projects--root
-               (remq (current-buffer) bufs)
-               gptel-projects--chat-buffers))))
-
-(defvar gptel-projects-table (make-hash-table :test 'equal)
-  "Hash table mapping project roots to their context file lists.")
-
-(defun gptel-projects--get-list ()
-  "Get the context list for current project."
-  (when-let ((root (projectile-project-root)))
-    (gethash root gptel-projects-table)))
-
-(defun gptel-projects--set-list (list)
-  "Set the context LIST for current project."
-  (when-let ((root (projectile-project-root)))
-    (puthash root list gptel-projects-table)))
-
-(defun gptel-projects--context-file ()
-  "Get the context file path for the current project."
-  (when-let ((project-root (projectile-project-root)))
-    (let ((file (expand-file-name gptel-projects-filename project-root)))
-      (message "Context file path: %s" file) ; Debug logging
-      file)))
-
-(defun gptel-projects--relative-to-root (file)
-  "Convert FILE path to be relative to project root if needed."
-  (if (and gptel-projects-relative-paths
-           (projectile-project-root))
-      (file-relative-name file (projectile-project-root))
-    file))
-
-(defun gptel-projects--absolute-from-root (file)
-  "Convert FILE path to absolute from project root if needed."
-  (if (and gptel-projects-relative-paths
-           (projectile-project-root)
-           (not (file-name-absolute-p file)))
-      (expand-file-name file (projectile-project-root))
-    file))
-
-(defun gptel-projects-save ()
-  "Save the current context list to project's context file."
-  (when-let ((context-file (gptel-projects--context-file)))
-    (let ((project-list (gptel-projects--get-list)))
-      (message "Saving context list: %S" project-list) ; Debug logging
-      (make-directory (file-name-directory context-file) t)
-      (with-temp-file context-file
-        (let ((print-length nil)
-              (print-level nil))
-          (prin1 project-list (current-buffer))))
-      (message "Saved context to %s" context-file))))
-
-(defun gptel-projects-load ()
-  "Load the context list from project's context file."
-  (when-let* ((context-file (gptel-projects--context-file))
-              ((file-exists-p context-file)))
-    (message "Loading context from: %s" context-file) ; Debug logging
-    ;; Clear existing context first
-    (gptel-context-remove-all)
-    ;; Load and apply new context
+(defun gptel-projects-workspace--extract-symbols (filename)
+  "Extract symbols from FILENAME using tree-sitter if available."
+  (when-let* ((lang (gptel-projects-workspace--get-treesit-language filename))
+              ((fboundp 'treesit-ready-p))
+              ((treesit-ready-p lang)))
     (with-temp-buffer
-      (insert-file-contents context-file)
-      (goto-char (point-min))
-      (gptel-projects--set-list (read (current-buffer)))
-      (message "Loaded context list: %S" (gptel-projects--get-list)) ; Debug logging
-      ;; Apply the loaded context
-      (gptel-projects-apply))))
+      (insert-file-contents filename)
+      (let* ((parser (treesit-parser-create lang))
+             (root-node (treesit-parser-root-node parser))
+             (symbols nil)
+             (patterns
+              (pcase lang
+                ('python
+                 '((class_definition name: (identifier) @class)
+                   (function_definition
+                    name: (identifier)
+                    parameters: (parameters)) @function))
+                ((or 'javascript 'jsx)
+                 '(((class_declaration name: (identifier) @class)
+                    (function_declaration
+                     name: (identifier)
+                     parameters: (formal_parameters)) @function
+                    (method_definition
+                     name: (property_identifier) @method
+                     parameters: (formal_parameters) @params))))
+                ((or 'typescript 'tsx)
+                 '(((class_declaration name: (type_identifier) @class)
+                    (function_declaration
+                     name: (identifier)
+                     parameters: (formal_parameters)) @function
+                    (method_definition
+                     name: (property_identifier)
+                     parameters: (formal_parameters)) @method)))
+                ('java
+                 '(((class_declaration name: (identifier) @class)
+                    (method_declaration
+                     name: (identifier)
+                     parameters: (formal_parameters)) @method)))
+                ('go
+                 '(((type_declaration (type_spec name: (type-identifier) @type))
+                    (function_declaration
+                     name: (identifier)
+                     parameters: (parameter_list)) @function)))
+                ('rust
+                 '(((function_item
+                     name: (identifier)) @function
+                     (struct_item name: (type_identifier) @struct))))
+                ('elisp
+                 '(((function_definition name: (symbol)
+                     parameters: (_)) @function))))))
+        (when patterns
+          (dolist (pattern patterns)
+            (dolist (match (treesit-query-capture root-node pattern))
+              (pcase-let ((`(,name . ,node) match))
+                (if (and (memq (intern (symbol-name name))
+                               '(function method definition.function)))
+                    (push (cons (intern (symbol-name name))
+                                (gptel-projects-workspace--format-symbol
+                                 (treesit-node-text (treesit-node-child-by-field-name node "name"))
+                                 (gptel-projects-workspace--get-parameters node lang)))
+                          symbols)
+                  (push (cons (intern (symbol-name name))
+                              (treesit-node-text node))
+                        symbols)))))
+          (treesit-parser-delete parser)
+          (nreverse symbols))))))
 
-(defun gptel-projects--add-and-save (rel-file abs-file)
-  "Add REL-FILE to context list and save after token check passes.
-ABS-FILE is the absolute path to the file."
-  (message "Adding file to context: %s" rel-file) ; Debug logging
-  (let ((project-list (or (gptel-projects--get-list) nil)))
-    (unless (member rel-file project-list)
-      (gptel-projects--set-list (cons rel-file project-list))
-      (gptel-projects-save)
-      (gptel-context-add-file abs-file)
-      (message "Added and saved %s to project context" rel-file))))
+(defun gptel-projects-workspace--symbols-to-context-string (file-symbols-alist)
+  "Convert FILE-SYMBOLS-ALIST to a context string.
+FILE-SYMBOLS-ALIST is an alist of the form (filename . symbols-alist)."
+  (with-temp-buffer
+    (dolist (file-entry file-symbols-alist)
+      (let ((file (car file-entry))
+            (symbols (cdr file-entry)))
+        (insert (format "\nFile: %s\n" file))
+        (insert "Symbols:\n")
+        (dolist (type '(class struct type impl function method var))
+          (let ((type-symbols
+                 (mapcar #'cdr
+                         (cl-remove-if-not
+                          (lambda (s) (eq (car s) type))
+                          symbols))))
+            (when type-symbols
+              (insert (format "  %s: %s\n"
+                              (capitalize (symbol-name type))
+                              (string-join type-symbols ",  "))))))))
+    (buffer-string)))
 
-(defun gptel-projects-add-file (file)
-  "Add FILE to the project's context list."
-  (interactive
-   (list (read-file-name "Add file to project context: "
-                         (projectile-project-root))))
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
+(defun gptel-projects-workspace-collect-code-info ()
+  "Collect information about code files in the current project.
+Returns a context string containing file paths and symbol information."
+  (when (projectile-project-root)
+    (let* ((all-files (projectile-project-files (projectile-project-root)))
+           (code-files
+            (seq-filter
+             (lambda (f)
+               (seq-some
+                (lambda (ext) (string-suffix-p ext f))
+                gptel-projects-workspace-code-file-extensions))
+             all-files))
+           (file-symbols nil))
+      (message "Collecting symbols for files: %S" code-files)
+      (when gptel-projects-workspace-collect-symbols
+        (dolist (file code-files)
+          (when-let ((symbols
+                      (gptel-projects-workspace--extract-symbols
+                       (expand-file-name file (projectile-project-root)))))
+            (message "Extracted symbols from %s: %S" file symbols)
+            (push (cons file symbols) file-symbols)))
+        (when file-symbols
+          (let ((context-str
+                 (concat "\n=== Symbol Information ===\n"
+                         (gptel-projects-workspace--symbols-to-context-string
+                          file-symbols))))
+            (message "Context string: %s" context-str)
+            context-str))))))
 
-  (let* ((rel-file (gptel-projects--relative-to-root file))
-         (abs-file (gptel-projects--absolute-from-root rel-file)))
-    (unless (member rel-file (gptel-projects--get-list))
-      ;; Check if adding would exceed token limit
-      (when (file-readable-p abs-file)
-        (let ((new-context
-               (concat
-                (or (gptel-context--string (gptel-context--collect)) "")
-                "\n\n"
-                (with-temp-buffer
-                  (insert-file-contents abs-file)
-                  (buffer-string)))))
-          (gptel-projects--check-token-limit
-           new-context
-           (lambda (within-limit)
-             (if within-limit
-                 (gptel-projects--add-and-save rel-file abs-file)
-               (message "File not added - would exceed token limit")))))))))
+(defun gptel-projects-workspace--add-code-info-to-context ()
+  "Add code file and symbol information to the current gptel context."
+  (message "Adding workspace context...")
+  (message "Current gptel-context--alist: %S" gptel-context--alist)
+  (when-let ((context-string (gptel-projects-workspace-collect-code-info)))
+    (message "Context buffer exists: %s" (get-buffer " *gptel-workspace-context*"))
+    (let ((buf (get-buffer-create " *gptel-workspace-context*")))
+      (message "Before buffer mod - gptel-context--alist: %S" gptel-context--alist)
+      (with-current-buffer buf
+        (erase-buffer)
+        (insert context-string)
+        (setq buffer-undo-list t)
+        (setq gptel-context--alist
+              (assq-delete-all buf gptel-context--alist))
+        (gptel-context--make-overlay (point-min) (point-max))))))
 
-(defun gptel-projects-remove-file (file)
-  "Remove FILE from the project's context list."
-  (interactive
-   (list (completing-read "Remove file from project context: "
-                          (or (gptel-projects--get-list) '()) nil t)))
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
+(defvar gptel-projects-workspace--watched-files nil
+  "List of files being monitored for updates in the current project.
+Each element is of the form (project-root . files) where files is
+a list of absolute file paths being monitored for context updates.")
 
-  (let ((abs-file (gptel-projects--absolute-from-root file)))
-    (gptel-projects--set-list
-     (delete file (gptel-projects--get-list)))
-    (gptel-projects-save)
-    (gptel-context-remove abs-file)
-    (message "Removed %s from project context" file)))
-
-(define-derived-mode gptel-projects-list-mode special-mode "GPTel Projects"
-  "Major mode for displaying GPTel project context lists."
-  (setq-local revert-buffer-function #'gptel-projects--refresh-list-buffer))
-
-(defun gptel-projects--refresh-list-buffer (&optional _ignore-auto _noconfirm)
-  "Refresh the GPTel projects list buffer."
-  (let* ((inhibit-read-only t)
-         (project-root default-directory)
-         (project-list (gptel-projects--get-list)))
-    (erase-buffer)
-    (insert (format "GPTel Context Files for Project: %s\n\n"
-                    (let ((default-directory project-root))
-                      (projectile-project-name))))
-    (if project-list
-        (dolist (file project-list)
-          (let ((abs-file (gptel-projects--absolute-from-root file )))
-            (insert (format "  %s%s\n" file
-                            (if (file-exists-p abs-file)
-                                ""
-                              " [missing]")))))
-      (insert "  No files in project context.\n"))
-    (goto-char (point-min))))
-
-(defun gptel-projects-list-files ()
-  "Display the list of files in the project's context."
-  (interactive)
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
-
-  (let ((buf (get-buffer-create "*GPTel Project Context*"))
-        (project-dir default-directory))
+(defun gptel-projects-workspace--watch-file (file)
+  "Set up save hook for FILE to update context."
+  (when-let ((buf (find-buffer-visiting file)))
     (with-current-buffer buf
-      (gptel-projects-list-mode)
-      (setq default-directory project-dir)
-      (gptel-projects--refresh-list-buffer))
-    (display-buffer buf)))
+      (add-hook 'after-save-hook #'gptel-projects-workspace--after-save-hook nil t))))
 
-(defun gptel-projects-apply ()
-  "Apply all files from the project's context list to the current gptel context."
+(defun gptel-projects-workspace--after-save-hook ()
+  "Hook run after saving a file that's part of the gptel context."
+  (when (and (buffer-file-name) (member (buffer-file-name) gptel-projects-workspace--watched-files))
+    (gptel-projects-workspace-update-code-info)))
+
+(defun gptel-projects-workspace--start-watching-files ()
+  "Start monitoring project files for changes."
+  (when (projectile-project-root)
+    (let* ((all-files (projectile-project-files (projectile-project-root)))
+           (code-files
+            (seq-filter
+             (lambda (f)
+               (seq-some
+                (lambda (ext) (string-suffix-p ext f))
+                gptel-projects-workspace-code-file-extensions))
+             all-files)))
+      (setq gptel-projects-workspace--watched-files
+            (mapcar (lambda (f)
+                      (expand-file-name f (projectile-project-root)))
+                    code-files))
+      (mapc #'gptel-projects-workspace--watch-file gptel-projects-workspace--watched-files))))
+
+(defun gptel-projects-workspace--stop-watching-files ()
+  "Stop monitoring project files for changes."
+  (when gptel-projects-workspace--watched-files
+    (dolist (file gptel-projects-workspaces--watched-files)
+      (when-let ((buf (find-buffer-visiting file)))
+        (with-current-buffer buf
+          (remove-hook 'after-save-hook
+                       #'gptel-projects-workspace--after-save-hook t))))
+    (setq gptel-projects-workspace--watched-files nil)))
+
+(defun gptel-projects-workspace-update-code-info ()
+  "Update the code information in the current gptel context."
   (interactive)
-  (when-let ((project-list (gptel-projects--get-list)))
-    (dolist (file project-list)
-      (let ((abs-file (gptel-projects--absolute-from-root file)))
-        (when (file-exists-p abs-file)
-          (gptel-context-add-file abs-file))))))
+  (save-excursion
+    ;; Only remove our workspace entries from gptel-context--alist
+    (setq gptel-context--alist
+          (cl-remove-if
+           (lambda (entry)
+             (let ((buf (car entry)))
+               (and (buffer-live-p buf)
+                    (string= " *gptel-workspace-context*"
+                             (buffer-name buf)))))
+           gptel-context--alist))
 
-(defun gptel-projects-clear ()
-  "Clear all context for the current project."
-  (interactive)
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
-  (gptel-projects--set-list nil)
-  (gptel-projects-save)
-  (gptel-context-remove-all)
-  (message "Cleared project context"))
+    ;; Kill old workspace buffer if it exists
+    (when-let ((old-buf (get-buffer " *gptel-workspace-context*")))
+      (kill-buffer old-buf))
 
-(defun gptel-projects--switch-project ()
-  "Handle switching project contexts.
-This should be called when switching projects or initializing a project."
-  (gptel-context-remove-all)
-  (gptel-projects--set-list nil)
-  (gptel-projects-load)
-  (when-let ((list-buf (get-buffer "*GPTel Project Context*")))
-    (with-current-buffer list-buf
-      (gptel-projects--refresh-list-buffer))))
+    ;; Add new context
+    (gptel-projects-workspace--add-code-info-to-context)
+    (gptel-projects-workspace--start-watching-files)))
 
-;;;###autoload
-(define-minor-mode gptel-projects-mode
-  "Automatically apply project-specific context in gptel buffers."
-  :global t
-  :group 'gptel-projects
-  (if gptel-projects-mode
-      (progn
-        (when (projectile-project-root)
-          (gptel-projects--switch-project))
-        (add-hook 'projectile-after-switch-project-hook
-                  #'gptel-projects-load)
-        (add-hook 'projectile-before-switch-project-hook
-                  #'gptel-projects--save-chats)
-        (add-hook 'gptel-mode-hook #'gptel-projects-apply)
-        (add-hook 'kill-emacs-hook
-                  (lambda ()
-                    (when gptel-projects-save-chats
-                      (maphash (lambda (root _)
-                                 (gptel-projects--save-chats root))
-                               gptel-projects--chat-buffers)))))
-    (remove-hook 'projectile-after-switch-project-hook
-                 #'gptel-projects-load)
-    (remove-hook 'projectile-before-switch-project-hook
-                 #'gptel-projects--save-chats)
-    (remove-hook 'gptel-mode-hook #'gptel-projects-apply)
-    (remove-hook 'kill-emacs-hook #'gptel-projects--save-chats)
-    (gptel-context-remove-all)
-    (gptel-projects--set-list nil)))
+(defun gptel-projects-workspace--cleanup()
+  "Clean up workspace resources."
+  (when-let ((buf (get-buffer " *gptel-workspace-context")))
+    (setq gptel-context--alist
+          (assq-delete-all buf gptel-context--alist))
+    (kill-buffer buf))
+  (gptel-projects-workspace--stop-watching-files))
 
-(defun gptel-projects-add-from-projectile ()
-  "Add files to context using projectile's file selection interface."
-  (interactive)
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
+(defun gptel-projects-workspace--stop-watching-project ()
+  "Stop monitoring files for current project if no more gptel buffers exist."
+  (when-let* ((root (projectile-project-root))
+              (project-buffers
+               (cl-loop for buf in (buffer-list)
+                        when (and (buffer-local-value 'gptel-projects-mode buf)
+                                  (equal (with-current-buffer buf
+                                           (projectile-project-root))
+                                         root))
+                        collect buf))
+              ((= (length project-buffers) 1))
+              ((eq (car project-buffers) (current-buffer))))
+    (gptel-projects-workspace--stop-watching-files)))
 
-  (let* ((file-candidates (projectile-project-files (projectile-project-root)))
-         (files (completing-read-multiple
-                 "Add files to context: "
-                 (mapcar (lambda (f) (concat f "|")) file-candidates)))
-         (count 0))
-    (dolist (file (mapcar (lambda (f) (string-remove-suffix "|" f)) files))
-      (unless (member file (gptel-projects--get-list))
-        (cl-incf count)
-        (let ((abs-file (gptel-projects--absolute-from-root file)))
-          (gptel-projects--add-and-save file abs-file))))
-    (when (> count 0)
-      (gptel-projects-save)
-      (message "Added %d file%s to project context"
-               count (if (= count 1) "" "s")))))
+(add-hook 'gptel-projects-mode-hook (lambda ()
+                                      (if gptel-projects-mode
+                                          (gptel-projects-workspace--start-watching-files)
+                                        (gptel-projects-workspace--cleanup))))
+(add-hook 'kill-buffer-hook #'gptel-projects-workspace--stop-watching-project)
 
-(setq request-log-level 'debug)
-
-(defun gptel-projects--count-tokens (text callback &optional model)
-  "Count tokens in TEXT using Anthropic's API and MODEL.
-Calls CALLBACK with the token count and model as arguments, or nil if counting fails.
-MODEL defaults to the current gptel-model.
-
-CALLBACK should be a function taking three arguments: (count model error-message).
-If successful, error-message will be nil."
-  (require 'request)
-  (let* ((model-name (gptel--model-name (or model gptel-model)))
-         (json-data (json-encode
-                     `((model . ,model-name)
-                       (messages . [((role . "user")
-                                     (content . ,text))])))))
-    (request "https://api.anthropic.com/v1/messages/count_tokens"
-      :type "POST"
-      :headers `(("Content-Type" . "application/json")
-                 ("anthropic-version" . "2023-06-01")
-                 ("x-api-key" . ,(gptel--get-api-key)))
-      :data json-data
-      :parser 'json-read
-      :error-parser 'json-read
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (funcall callback (cdr (assq 'input_tokens data)) model-name nil)))
-      :error (cl-function
-              (lambda (&key error-thrown response &allow-other-keys)
-                (let* ((response-status (request-response-status-code response))
-                       (error-msg
-                        (or (when-let ((err-json (request-response-data response)))
-                              (plist-get err-json :error))
-                            error-thrown)))
-                  (funcall callback nil model-name
-                           (format "Token count failed: HTTP %s - %S"
-                                   response-status error-msg))))))))
-
-(defun gptel-projects-show-token-count ()
-  "Display token count for current project context."
-  (interactive)
-  (unless (projectile-project-root)
-    (user-error "Not in a projectile project"))
-
-  (if (null (gptel-projects--get-list))
-      (message "Project context is empty - 0 tokens")
-    (let ((context (gptel-context--string
-                    (gptel-context--collect))))
-      (if (null context)
-          (message "Project context is empty - 0 tokens")
-        (gptel-projects--count-tokens
-         context
-         (lambda (token-count model error-message)
-           (if token-count
-               (let ((limit (alist-get (gptel--intern model)
-                                       gptel-projects-token-limits)))
-                 (message "Project context uses approximately %d tokens%s"
-                          token-count
-                          (if (and limit (> token-count limit))
-                              (format " (EXCEEDS %s's %d token LIMIT!)"
-                                      model limit)
-                            (format " (%s's limit: %s)"
-                                    model (if limit
-                                              (format "%d tokens" limit)
-                                            "none")))))
-             (message "Failed to count tokens: %s" error-message))))))))
-
-(cl-defun gptel-projects--check-token-limit (text callback)
-  "Check if TEXT would exceed token limit.
-Calls CALLBACK with t if within limit or no limit set, nil otherwise.
-Prompts user depending on gptel-projects-token-limit-action."
-  (gptel-projects--count-tokens
-   text
-   (lambda (token-count model error)
-     (let ((limit (and model (alist-get (gptel--intern model)
-                                        gptel-projects-token-limits))))
-       (if (or error (null limit))
-           (funcall callback t)         ; Count failed or no limit, assume ok
-         (if (<= token-count limit)
-             (funcall callback t)
-           (pcase gptel-projects-token-limit-action
-             ('warn
-              (message "Warning: Context exceeds %s's token limit (%d > %d)"
-                       model token-count limit)
-              (funcall callback t))
-             ('ask
-              (if (y-or-n-p
-                   (format "Context exceeds %s's token limit (%d > %d). Continue? "
-                           model token-count limit))
-                  (funcall callback t)
-                (funcall callback nil)))
-             ('block (funcall callback nil)))))))))
-
-(provide 'gptel-projects)
-;;; gptel-projects.el ends here
+(provide 'gptel-projects-workspace)
+;;; gptel-projects-workspace.el ends here
