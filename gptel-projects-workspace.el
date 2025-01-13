@@ -331,6 +331,9 @@ a list of absolute file paths being monitored for context updates.")
               ((eq (car project-buffers) (current-buffer))))
     (gptel-projects-workspace--stop-watching-files)))
 
+(add-hook 'gptel-mode-hook
+          (lambda ()
+            (gptel-projects-workspace-update-code-info)))
 (add-hook 'gptel-projects-mode-hook (lambda ()
                                       (if gptel-projects-mode
                                           (gptel-projects-workspace--start-watching-files)

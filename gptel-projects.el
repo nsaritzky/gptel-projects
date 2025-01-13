@@ -404,9 +404,23 @@ ABS-FILE is the absolute path to the file."
     (gptel-context-remove abs-file)
     (message "Removed %s from project context" file)))
 
+(defun gptel-projects--remove-file-from-context ()
+  "Remove the file at point from the context (file list)."
+  (interactive)
+  (let ((file-name (get-text-property (point) 'action)))
+    (when (and file-name (functionp file-name))
+      (let ((file-path (funcall file-name)))
+        (when (y-or-n-p (format "Remove '%s'? from context? " (file-name-nondirectory file-path)))
+          (let ((inhibit-read-only t))
+            (delete-region (line-beginning-position) (line-beginning-position 2))
+            (message "File '%s' removed from context." (file-name-nondirectory file-path))))))))
+
 (define-derived-mode gptel-projects-list-mode special-mode "GPTel Projects"
   "Major mode for displaying GPTel project context lists."
-  (setq-local revert-buffer-function #'gptel-projects--refresh-list-buffer))
+  (setq-local revert-buffer-function #'gptel-projects--refresh-list-buffer)
+  (use-local-map
+   (let ((map (make-sparse-keymap)))
+     (define-key map (kbd "d") 'gptel-projects--delete-file-at-point))))
 
 (defun gptel-projects--refresh-list-buffer (&optional _ignore-auto _noconfirm)
   "Refresh the GPTel projects list buffer."
