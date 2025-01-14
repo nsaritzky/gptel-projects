@@ -117,7 +117,7 @@ to the context when analyzing project files."
               ((fboundp 'treesit-ready-p))
               ((treesit-ready-p lang)))
     (with-temp-buffer
-      (insert-file-contents filename)
+      (insert-file-contents (gptel-projects--absolute-from-root filename))
       (let* ((parser (treesit-parser-create lang))
              (root-node (treesit-parser-root-node parser))
              (symbols nil)
@@ -280,7 +280,10 @@ to the context when analyzing project files."
                    (:equal @name ,symbol)) @let))))
            (query (treesit-query-compile language query-patterns))
            (node (cdar (treesit-query-capture root-node query))))
-      (cons (treesit-node-start node) (treesit-node-end node)))))
+      (when node
+        (buffer-substring-no-properties
+         (treesit-node-start node)
+         (treesit-node-end node))))))
 
 (defun gptel-projects-workspace--symbols-to-context-string (file-symbols-alist)
   "Convert FILE-SYMBOLS-ALIST to a context string.
@@ -384,7 +387,7 @@ a list of absolute file paths being monitored for context updates.")
 (defun gptel-projects-workspace--stop-watching-files ()
   "Stop monitoring project files for changes."
   (when gptel-projects-workspace--watched-files
-    (dolist (file gptel-projects-workspaces--watched-files)
+    (dolist (file gptel-projects-workspace--watched-files)
       (when-let ((buf (find-buffer-visiting file)))
         (with-current-buffer buf
           (remove-hook 'after-save-hook
