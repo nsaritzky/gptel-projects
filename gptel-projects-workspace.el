@@ -180,110 +180,113 @@ to the context when analyzing project files."
 
 (defun gptel-projects-workspace-get-symbol-definition (filename symbol)
   "Find definition of SYMBOL in FILENAME using tree-sitter."
-  (with-current-buffer (find-file-noselect filename)
-    (unless (treesit-parser-list)
-      (treesit-parser-create (gptel-projects-workspace--get-treesit-language filename)))
-    (let* ((parser (car (treesit-parser-list)))
-           (root-node (treesit-parser-root-node parser))
-           (language (treesit-parser-language parser))
-           (query-patterns
-            (pcase language
-              ('elisp
-               `((function_definition
-                  name: (symbol) @name
-                  (:equal @name ,symbol)) @function))
-              ('java
-               `((method_declaration
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @method
-                  (class_declaration
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @class
-                  (field_declaration
-                   declarator: (variable_declarator
-                                name: (identifier) @name
-                                (:equal @name ,symbol)) @field)))
-              ((or 'javascript 'typescript 'tsx)
-               `((function_declaration
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @function
-                  (class_declaration
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @class
-                  (method_definition
-                   name: (property_identifier) @name
-                   (:equal @name ,symbol)) @method
-                  (variable_declaration
-                   declarator: (variable_declarator
-                                name: (identifier) @name
-                                (:equal @name ,symbol))) @var
-                  (arrow_function
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @arrow))
-              ('jsx
-               `((function_declaration
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @function
-                  (class_declaration
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @class
-                  (method_definition
-                   name: (property_identifier) @name
-                   (:equal @name ,symbol)) @method
-                  (variable_declaration
-                   declarator: (variable_declarator
-                                name: (identifier) @name
-                                (:equal @name ,symbol))) @var
-                  (arrow_function
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @arrow))
-              ('go
-               `((function_declaration
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @function
-                  (method_declaration
-                   name: (field_identifier) @name
-                   (:equal @name ,symbol)) @method
-                  (const_declaration
-                   (const_spec
+  (let ((abs-file (gptel-projects--absolute-from-root filename)))
+    (unless (file-exists-p abs-file)
+      (error "File does not exist: %s" abs-file))
+    (with-current-buffer (find-file-noselect abs-file)
+      (unless (treesit-parser-list)
+        (treesit-parser-create (gptel-projects-workspace--get-treesit-language abs-file)))
+      (let* ((parser (car (treesit-parser-list)))
+             (root-node (treesit-parser-root-node parser))
+             (language (treesit-parser-language parser))
+             (query-patterns
+              (pcase language
+                ('elisp
+                 `((function_definition
+                    name: (symbol) @name
+                    (:equal @name ,symbol)) @function))
+                ('java
+                 `((method_declaration
                     name: (identifier) @name
-                    (:equal @name ,symbol))) @const
-                  (var_declaration
-                   (var_spec
+                    (:equal @name ,symbol)) @method
+                    (class_declaration
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @class
+                    (field_declaration
+                     declarator: (variable_declarator
+                                  name: (identifier) @name
+                                  (:equal @name ,symbol)) @field)))
+                ((or 'javascript 'typescript 'tsx)
+                 `((function_declaration
                     name: (identifier) @name
-                    (:equal @name ,symbol))) @var))
-              ('python
-               `((function_definition
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @function
-                  (class_definition
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @class
-                  (assignment
-                   left: (identifier) @name
-                   (:equal @name ,symbol)) @assignment))
-              ('rust
-               `((function_item
-                  name: (identifier) @name
-                  (:equal @name ,symbol)) @function
-                  (struct_item
-                   name: (type_identifier) @name
-                   (:equal @name ,symbol)) @struct
-                  (impl_item
-                   type: (type_identifier) @name
-                   (:equal @name ,symbol)) @impl
-                  (const_item
-                   name: (identifier) @name
-                   (:equal @name ,symbol)) @const
-                  (let_declaration
-                   pattern: (identifier) @name
-                   (:equal @name ,symbol)) @let))))
-           (query (treesit-query-compile language query-patterns))
-           (node (cdar (treesit-query-capture root-node query))))
-      (when node
-        (buffer-substring-no-properties
-         (treesit-node-start node)
-         (treesit-node-end node))))))
+                    (:equal @name ,symbol)) @function
+                    (class_declaration
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @class
+                    (method_definition
+                     name: (property_identifier) @name
+                     (:equal @name ,symbol)) @method
+                    (variable_declaration
+                     declarator: (variable_declarator
+                                  name: (identifier) @name
+                                  (:equal @name ,symbol))) @var
+                    (arrow_function
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @arrow))
+                ('jsx
+                 `((function_declaration
+                    name: (identifier) @name
+                    (:equal @name ,symbol)) @function
+                    (class_declaration
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @class
+                    (method_definition
+                     name: (property_identifier) @name
+                     (:equal @name ,symbol)) @method
+                    (variable_declaration
+                     declarator: (variable_declarator
+                                  name: (identifier) @name
+                                  (:equal @name ,symbol))) @var
+                    (arrow_function
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @arrow))
+                ('go
+                 `((function_declaration
+                    name: (identifier) @name
+                    (:equal @name ,symbol)) @function
+                    (method_declaration
+                     name: (field_identifier) @name
+                     (:equal @name ,symbol)) @method
+                    (const_declaration
+                     (const_spec
+                      name: (identifier) @name
+                      (:equal @name ,symbol))) @const
+                    (var_declaration
+                     (var_spec
+                      name: (identifier) @name
+                      (:equal @name ,symbol))) @var))
+                ('python
+                 `((function_definition
+                    name: (identifier) @name
+                    (:equal @name ,symbol)) @function
+                    (class_definition
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @class
+                    (assignment
+                     left: (identifier) @name
+                     (:equal @name ,symbol)) @assignment))
+                ('rust
+                 `((function_item
+                    name: (identifier) @name
+                    (:equal @name ,symbol)) @function
+                    (struct_item
+                     name: (type_identifier) @name
+                     (:equal @name ,symbol)) @struct
+                    (impl_item
+                     type: (type_identifier) @name
+                     (:equal @name ,symbol)) @impl
+                    (const_item
+                     name: (identifier) @name
+                     (:equal @name ,symbol)) @const
+                    (let_declaration
+                     pattern: (identifier) @name
+                     (:equal @name ,symbol)) @let))))
+             (query (treesit-query-compile language query-patterns))
+             (node (cdar (treesit-query-capture root-node query))))
+        (when node
+          (buffer-substring-no-properties
+           (treesit-node-start node)
+           (treesit-node-end node)))))))
 
 (defun gptel-projects-workspace--symbols-to-context-string (file-symbols-alist)
   "Convert FILE-SYMBOLS-ALIST to a context string.
