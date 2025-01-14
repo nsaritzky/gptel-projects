@@ -148,12 +148,12 @@ to the context when analyzing project files."
                     (variable_declarator) @var
                     (interface_declaration) @interface)))
                 ('java
-                 '((class_declaration name: (identifier) @class)
-                   (method_declaration
-                    name: (identifier)
-                    parameters: (formal_parameters)) @method
-                   (interface_declaration
-                    name: (identifier) @interface)))
+                 '(((class_declaration name: (identifier) @class)
+                    (method_declaration
+                     name: (identifier)
+                     parameters: (formal_parameters)) @method
+                    (interface_declaration
+                     name: (identifier) @interface))))
                 ('go
                  '(((type_declaration (type_spec name: (type-identifier) @type))
                     (function_declaration
