@@ -135,7 +135,8 @@ to the context when analyzing project files."
                      parameters: (formal_parameters)) @function
                     (method_definition
                      name: (property_identifier) @method
-                     parameters: (formal_parameters) @params))))
+                     parameters: (formal_parameters) @params)
+                    (variable_declarator) @var)))
                 ((or 'typescript 'tsx)
                  '(((class_declaration name: (type_identifier) @class)
                     (function_declaration
@@ -143,12 +144,16 @@ to the context when analyzing project files."
                      parameters: (formal_parameters)) @function
                     (method_definition
                      name: (property_identifier)
-                     parameters: (formal_parameters)) @method)))
+                     parameters: (formal_parameters)) @method
+                    (variable_declarator) @var
+                    (interface_declaration) @interface)))
                 ('java
                  '(((class_declaration name: (identifier) @class)
                     (method_declaration
                      name: (identifier)
-                     parameters: (formal_parameters)) @method)))
+                     parameters: (formal_parameters)) @method
+                    (interface_declaration
+                     name: (type_identifier) @interface))))
                 ('go
                  '(((type_declaration (type_spec name: (type-identifier) @type))
                     (function_declaration
@@ -166,7 +171,7 @@ to the context when analyzing project files."
             (dolist (match (treesit-query-capture root-node pattern))
               (pcase-let ((`(,name . ,node) match))
                 (if (and (memq (intern (symbol-name name))
-                               '(function method definition.function)))
+                               '(function method definition.function var interface)))
                     (push (cons (intern (symbol-name name))
                                 (gptel-projects-workspace--format-symbol
                                  (treesit-node-text (treesit-node-child-by-field-name node "name"))
@@ -202,44 +207,36 @@ to the context when analyzing project files."
                     (class_declaration
                      name: (identifier) @name
                      (:equal @name ,symbol)) @class
+                    (interface_declaration
+                     name: (type_identifier) @name
+                     (:equal @name ,symbol)) @interface
                     (field_declaration
                      declarator: (variable_declarator
                                   name: (identifier) @name
                                   (:equal @name ,symbol)) @field)))
-                ((or 'javascript 'typescript 'tsx)
+                ((or 'javascript 'jsx)
                  `((function_declaration
                     name: (identifier) @name
                     (:equal @name ,symbol)) @function
-                    (class_declaration
-                     name: (identifier) @name
-                     (:equal @name ,symbol)) @class
                     (method_definition
                      name: (property_identifier) @name
                      (:equal @name ,symbol)) @method
-                    (variable_declaration
-                     declarator: (variable_declarator
-                                  name: (identifier) @name
-                                  (:equal @name ,symbol))) @var
-                    (arrow_function
-                     name: (identifier) @name
-                     (:equal @name ,symbol)) @arrow))
-                ('jsx
+                    (variable_declarator
+                     name: (_) @name
+                     (:equal @name ,symbol)) @var))
+                ((or 'typescript 'tsx)
                  `((function_declaration
                     name: (identifier) @name
                     (:equal @name ,symbol)) @function
-                    (class_declaration
-                     name: (identifier) @name
-                     (:equal @name ,symbol)) @class
                     (method_definition
                      name: (property_identifier) @name
                      (:equal @name ,symbol)) @method
-                    (variable_declaration
-                     declarator: (variable_declarator
-                                  name: (identifier) @name
-                                  (:equal @name ,symbol))) @var
-                    (arrow_function
-                     name: (identifier) @name
-                     (:equal @name ,symbol)) @arrow))
+                    (variable_declarator
+                     name: (_) @name
+                     (:equal @name ,symbol)) @var
+                    (interface_declaration
+                     name: (type_identifier) @name
+                     (:equal @name ,symbol)) @interface))
                 ('go
                  `((function_declaration
                     name: (identifier) @name
