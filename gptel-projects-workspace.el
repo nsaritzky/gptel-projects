@@ -319,30 +319,23 @@ Returns a context string containing file paths and symbol information."
                 gptel-projects-workspace-code-file-extensions))
              all-files))
            (file-symbols nil))
-      (message "Collecting symbols for files: %S" code-files)
       (when gptel-projects-workspace-collect-symbols
         (dolist (file code-files)
           (when-let ((symbols
                       (gptel-projects-workspace--extract-symbols
                        (expand-file-name file (projectile-project-root)))))
-            (message "Extracted symbols from %s: %S" file symbols)
             (push (cons file symbols) file-symbols)))
         (when file-symbols
           (let ((context-str
                  (concat "\n=== Symbol Information ===\n"
                          (gptel-projects-workspace--symbols-to-context-string
                           file-symbols))))
-            (message "Context string: %s" context-str)
             context-str))))))
 
 (defun gptel-projects-workspace--add-code-info-to-context ()
   "Add code file and symbol information to the current gptel context."
-  (message "Adding workspace context...")
-  (message "Current gptel-context--alist: %S" gptel-context--alist)
   (when-let ((context-string (gptel-projects-workspace-collect-code-info)))
-    (message "Context buffer exists: %s" (get-buffer " *gptel-workspace-context*"))
     (let ((buf (get-buffer-create " *gptel-workspace-context*")))
-      (message "Before buffer mod - gptel-context--alist: %S" gptel-context--alist)
       (with-current-buffer buf
         (erase-buffer)
         (insert context-string)
