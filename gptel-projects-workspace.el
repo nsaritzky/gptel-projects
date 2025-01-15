@@ -171,7 +171,7 @@ to the context when analyzing project files."
             (dolist (match (treesit-query-capture root-node pattern))
               (pcase-let ((`(,name . ,node) match))
                 (if (and (memq (intern (symbol-name name))
-                               '(function method definition.function var interface)))
+                               '(function method definition.function var interface class type)))
                     (push (cons (intern (symbol-name name))
                                 (gptel-projects-workspace--format-symbol
                                  (treesit-node-text (treesit-node-child-by-field-name node "name"))
