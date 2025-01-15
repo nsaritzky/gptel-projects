@@ -208,7 +208,7 @@ to the context when analyzing project files."
                      name: (identifier) @name
                      (:equal @name ,symbol)) @class
                     (interface_declaration
-                     name: (type_identifier) @name
+                     name: (identifier) @name
                      (:equal @name ,symbol)) @interface
                     (field_declaration
                      declarator: (variable_declarator
