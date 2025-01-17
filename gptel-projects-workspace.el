@@ -405,9 +405,14 @@ a list of absolute file paths being monitored for context updates.")
     (when-let ((old-buf (get-buffer " *gptel-workspace-context*")))
       (kill-buffer old-buf))
 
-    ;; Add new context
-    (gptel-projects-workspace--add-code-info-to-context)
-    (gptel-projects-workspace--start-watching-files)))
+    (condition-case err
+        (progn
+          (gptel-projects-workspace--add-code-info-to-context)
+          (gptel-projects-workspace--start-watching-files))
+      (file-error
+       (projectile-invalidate-cache nil)
+       (gptel-projects-workspace--add-code-info-to-context)
+       (gptel-projects-workspace--start-watching-files)))))
 
 (defun gptel-projects-workspace--cleanup()
   "Clean up workspace resources."
